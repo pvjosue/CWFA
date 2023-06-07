@@ -18,7 +18,7 @@
 ## About
 
 
-<img src="images/fig_CWFA.jpg">
+<img src="images/fig_CWFA.png">
 
 ## Installation
 
