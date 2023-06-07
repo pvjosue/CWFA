@@ -18,7 +18,7 @@
 ## About
 
 
-<img src="images/fig_Conditioned Wavelet Flow.pdf">
+<img src="images/fig_CWFA.pdf">
 
 ## Installation
 
