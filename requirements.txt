@@ -1,0 +1,11 @@
+lion_pytorch==0.0.7
+matplotlib==3.5.1
+multipagetiff==3.0.7
+numpy==1.22.3
+pandas==1.4.2
+scikit_learn==1.0.2
+tifffile==2021.11.2
+torch==1.12.1+cu113
+torchvision==0.13.1+cu113
+tensorboard==2.13.0
+tqdm==4.64.0
