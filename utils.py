@@ -6,6 +6,7 @@ import torch.nn.functional as F
 import torch.nn as nn
 from typing import Tuple
 from tifffile import imsave
+from tqdm import tqdm
 import matplotlib.pyplot as plt
 
 from XLFMDataset import *
@@ -355,6 +356,7 @@ def imshow3D(vol, blocking=False, normalize=True, color_map='gray',add_scale_bar
     if blocking:
         plt.show()
 
+
 def save_image(tensor, path='output.png',color_map='gray'):
     """
     Save an image to a specified path. If the tensor is 3D, display it using imshow3D. If it is 2D, display it using imshow2D. If the path is a tif file, save the tensor as a tif file using imsave.
@@ -442,3 +444,295 @@ def norm_data(data, filter=10):
         m_d1 = 1
     d2 = d1 / m_d1
     return d2,max_d1-min_d1,
+
+
+############## Deconvolutions #########################
+
+def roll_n(X, axis, n):
+    """
+    Roll the tensor X along the given axis by n positions.
+    @param X - the tensor to roll
+    @param axis - the axis to roll along
+    @param n - the number of positions to roll
+    @return The rolled tensor
+    """
+    f_idx = tuple(slice(None, None, None) if i != axis else slice(0, n, None) for i in range(X.dim()))
+    b_idx = tuple(slice(None, None, None) if i != axis else slice(n, None, None) for i in range(X.dim()))
+    front = X[f_idx]
+    back = X[b_idx]
+    return torch.cat([back, front], axis)
+    
+def batch_fftshift2d_real(x):
+    """
+    This function performs a 2D FFT shift on a batch of real-valued tensors.
+    @param x - the input tensor
+    @return The shifted tensor
+    """
+    out = x
+    for dim in range(2, len(out.size())):
+        n_shift = x.size(dim)//2
+        if x.size(dim) % 2 != 0:
+            n_shift += 1  # for odd-sized images
+        out = roll_n(out, axis=dim, n=n_shift)
+    return out  
+
+# FFT convolution, the kernel fft can be precomputed
+def fft_conv(A,B, fullSize, Bshape=[],B_precomputed=False):
+    """
+    This function performs a convolution between two tensors using the FFT algorithm.
+    @param A - the first tensor
+    @param B - the second tensor
+    @param fullSize - the size of the output tensor
+    @param Bshape - the shape of the second tensor
+    @param B_precomputed - whether the second tensor has already been precomputed
+    @return the result of the convolution and the precomputed second tensor
+    """
+    import torch.fft
+    nDims = A.ndim-2
+    padSizeA = (fullSize - torch.tensor(A.shape[2:]))
+    padSizesA = torch.zeros(2*nDims,dtype=int)
+    padSizesA[0::2] = torch.floor(padSizeA/2.0)
+    padSizesA[1::2] = torch.ceil(padSizeA/2.0)
+    padSizesA = list(padSizesA.numpy()[::-1])
+
+    A_padded = F.pad(A,padSizesA)
+    Afft = torch.fft.rfft2(A_padded)
+    if B_precomputed:
+        return batch_fftshift2d_real(torch.fft.irfft2( Afft * B.detach()))
+    else:
+        padSizeB = (fullSize - torch.tensor(B.shape[2:]))
+        padSizesB = torch.zeros(2*nDims,dtype=int)
+        padSizesB[0::2] = torch.floor(padSizeB/2.0)
+        padSizesB[1::2] = torch.ceil(padSizeB/2.0)
+        padSizesB = list(padSizesB.numpy()[::-1])
+        B_padded = F.pad(B,padSizesB)
+        Bfft = torch.fft.rfft2(B_padded)
+        return batch_fftshift2d_real(torch.fft.irfft2( Afft * Bfft.detach())), Bfft.detach()
+
+# Split an fft convolution into batches containing different depths
+def fft_conv_split(A, B, psf_shape, n_split, B_precomputed=False, device = "cpu"):
+    """
+    This function performs a convolution between two tensors using FFT. The input tensors are split into smaller chunks to reduce memory usage. 
+    @param A - the first tensor to be convolved
+    @param B - the second tensor to be convolved
+    @param psf_shape - the shape of the point spread function
+    @param n_split - the number of splits to perform on the input tensors
+    @param B_precomputed - a boolean indicating whether the second tensor has already been transformed using FFT
+    @param device - the device to perform the computation on
+    @return the result of the convolution
+    """
+    n_depths = A.shape[1]
+    
+    split_conv = n_depths//n_split
+    depths = list(range(n_depths))
+    depths = [depths[i:i + split_conv] for i in range(0, n_depths, split_conv)]
+
+    fullSize = torch.tensor(A.shape[2:]) + psf_shape
+    
+    crop_pad = [int(psf_shape[i] - fullSize[i])//2 for i in range(0,2)]
+    crop_pad = (crop_pad[1], (psf_shape[-1]- fullSize[-1])-crop_pad[1], crop_pad[0], (psf_shape[-2] - fullSize[-2])-crop_pad[0])
+    # Crop convolved image to match size of PSF
+    img_new = torch.zeros(A.shape[0], 1, psf_shape[0], psf_shape[1], device=device)
+    if B_precomputed == False:
+        OTF_out = torch.zeros(1, n_depths, fullSize[0], int(fullSize[1])//2+1, requires_grad=False, dtype=torch.complex64, device=device)
+    for n in range(n_split):
+        # print(n)
+        curr_psf = B[:,depths[n],...].to(device)
+        img_curr = fft_conv(A[:,depths[n],...].to(device), curr_psf, fullSize, psf_shape, B_precomputed)
+        if B_precomputed == False:
+            OTF_out[:,depths[n],...] = img_curr[1]
+            img_curr = img_curr[0]
+        img_curr = F.pad(img_curr, crop_pad)
+        img_new += img_curr[:,:,:psf_shape[0],:psf_shape[1]].sum(1).unsqueeze(1).abs()
+    
+    if B_precomputed == False:
+        return img_new, OTF_out
+    return img_new
+
+
+def load_PSF(filename, depths_to_use=[], interleaved=True):
+    """
+    Load a point spread function (PSF) from a file and return it as a tensor.
+    @param filename - the name of the file containing the PSF
+    @param depths_to_use - the depths to use in the PSF
+    @param interleaved - whether the PSF is interleaved
+    @return a tensor containing the PSF
+    """
+    # Load PSF
+    print("Loading PSF...")
+    try:
+        # Check permute
+        psfIn = torch.from_numpy(loadmat(filename)['PSF']).permute(2,0,1).unsqueeze(0)
+    except:
+        try:
+            psfFile = h5py.File(filename,'r')
+            psfIn = torch.from_numpy(psfFile.get('PSF')[:]).unsqueeze(0)
+        except:
+            psfIn = torch.from_numpy(imread(filename).astype(np.float32)).unsqueeze(0)
+
+    # Make a square PSF
+    psfIn = pad_img_to_min(psfIn)
+
+    # Grab only needed depths
+    if isinstance(depths_to_use, int):
+        if depths_to_use==-1:
+            depths_to_use = list(range(psfIn.shape[1]))
+        else:
+            n_depths = depths_to_use
+            if interleaved:
+                depths_to_use = torch.linspace(0, psfIn.shape[1], n_depths+2).long()[1:-1]
+            else:
+                depths_to_use = list(range(psfIn.shape[1]//2 - n_depths//2+1, psfIn.shape[1]//2- n_depths//2+1 + n_depths))
+    psfIn = psfIn[:, depths_to_use, ...]
+    # Normalize psfIn such that each depth sum is equal to 1
+    for nD in range(psfIn.shape[1]):
+        psfIn[:,nD,...] = psfIn[:,nD,...] / psfIn[:,nD,...].sum()
+    
+    return psfIn
+
+def load_PSF_OTF(filename, vol_size, n_split=20, downS=1, device="cpu",
+    dark_current=106, calc_max=False, compute_OTF=False):
+    """
+    Load the point spread function (PSF) and optical transfer function (OTF) from a file.
+    @param filename - the name of the file containing the PSF
+    @param vol_size - the size of the volume
+    @param n_split - the number of splits
+    @param downS - the downsample factor
+    @param device - the device to use
+    @param dark_current - the dark current
+    @param calc_max - whether to calculate the maximum
+    @param compute_OTF - whether to compute the OTF
+    @return the OTF and the PSF shape
+    """
+                 
+    n_depths = vol_size[-1]
+    if n_split == -1:
+        n_split = n_depths
+    
+    # Load PSF
+    psfIn = load_PSF(filename, n_depths)
+
+    psf_shape = torch.tensor(psfIn.shape[2:])
+    vol = torch.rand(1,psfIn.shape[1], vol_size[0], vol_size[1], device=device)
+    img, OTF = fft_conv_split(vol, psfIn.float().detach().to(device), psf_shape, n_split=n_split, device=device)
+    
+    OTF = OTF.detach()
+
+    if compute_OTF:
+        OTFt = torch.real(OTF) - 1j * torch.imag(OTF)
+        OTF = torch.cat((OTF.unsqueeze(-1), OTFt.unsqueeze(-1)), 4)
+    if calc_max:
+        return OTF, psf_shape, psfMaxCoeffs
+    else:
+        return OTF,psf_shape
+
+
+def XLFMDeconv(OTF, img, nIt, ObjSize=[512,512], PSFShape=[2160,2160], ROIsize=[512,512,90],\
+                 errorMetric=F.mse_loss, n_split_fourier=1, update_median_limit_multiplier=10,\
+                    max_allowed=4500, device='cuda:0', all_in_device=False, verbose=False):
+    """
+    This function performs deconvolution on an image using a given OTF. It returns the reconstructed object, the projections of the object, the estimated image, the losses, and the padding sizes.
+    @param OTF - The optical transfer function
+    @param img - The input image
+    @param nIt - The number of iterations to perform
+    @param ObjSize - The size of the object
+    @param PSFShape - The shape of the point spread function
+    @param ROIsize - The size of the region of interest
+    @param errorMetric - The error metric to use
+    @param n_split_fourier - The number of splits to use in the Fourier transform
+    @param update_median_limit_multiplier - The multiplier to use when updating the median limit
+    @param max_allowed - The maximum
+    """
+    
+    if n_split_fourier == 1:
+        n_split_fourier = OTF.shape[1]
+    reconType = OTF.type()
+    nDepths = OTF.shape[1]
+    MI_projection_out = 0
+    
+    if img.sum()==0:
+        volOut = torch.zeros(img.shape[0],nDepths, ObjSize[0], ObjSize[1]).type(reconType)
+        MI_projection_out= volume_2_projections(volOut.permute(0,2,3,1).unsqueeze(1)).cpu()
+        return volOut, MI_projection_out, img, []
+
+    
+    PSFShape = torch.tensor(PSFShape)
+
+    # Compute transposed OTF
+    if OTF.ndim==4: # meaning that the transpose hasn't been computed
+        OTF = torch.cat((OTF.unsqueeze(-1), (torch.real(OTF) - 1j * torch.imag(OTF)).unsqueeze(-1)),dim=4)
+    OTFt = OTF[...,1].clone()
+    OTF = OTF[...,0].clone()
+
+    padSize = 2*[(OTF.shape[2] - ObjSize[0])//2] + 2*[(OTF.shape[2] - ObjSize[1])//2]
+    padSizeImg = 2*[(OTF.shape[2] - img.shape[2])//2] + 2*[(OTF.shape[2] - img.shape[3])//2]
+
+    # Pad input
+    ImgExp = F.pad(img, padSizeImg).to(device)
+
+    with torch.no_grad():
+        # Initialize reconstructed volume
+        ObjRecon = torch.ones(1,nDepths,ObjSize[0],ObjSize[1])#.type(dtype=reconType)
+        
+        ImgEst = 0* ImgExp.clone()
+
+        if all_in_device:
+            ObjRecon = ObjRecon.to(device)
+            OTF = OTF.to(device)
+            OTFt = OTFt.to(device)
+            ImgEst = ImgEst.to(device)
+            ImgExp = ImgExp.to(device)
+
+        losses = []
+        end = "\r"
+        # plt.ion()
+        # plt.figure()
+        for ii in tqdm(range(nIt), position=1, desc="Deconv Iter.", leave=False, colour='red'):
+            
+            # Compute current image estimate (forward projection)
+            ImgEst *= 0.0
+            ObjTemp = F.pad(ObjRecon, padSize)
+            for jj in range(0,nDepths, n_split_fourier):
+                curr_depths = list(range(jj, min(jj+n_split_fourier, nDepths)))
+                planeOTF = OTF[:,curr_depths,...].to(device)
+                currObjPlanes = ObjTemp[:,curr_depths,...]
+                planeObjFFT = torch.fft.rfft2(currObjPlanes).to(device)
+                ImgEst += F.relu(batch_fftshift2d_real(torch.fft.irfft2(planeObjFFT * planeOTF))).sum(1).unsqueeze(1)
+            Tmp = ImgExp / (ImgEst+1e-8)    
+            if Tmp[Tmp!=0].numel()>0:
+                Tmp.clamp_(0.0,Tmp[Tmp!=0].median()*update_median_limit_multiplier)
+            
+            Ratio = Tmp.to(device)
+
+            if torch.isnan(Ratio).any():
+                print(F'nan found at it: {ii+1} ')
+                break
+            # Propagate error back to volume space and update volume
+            for jj in range(0,nDepths, n_split_fourier):
+                curr_depths = list(range(jj,min(jj+n_split_fourier, nDepths)))
+                planeObj = ObjTemp[:,curr_depths,...].to(device)
+                planeOTF = OTFt[:,curr_depths,...].to(device)
+                ObjRecon[:,curr_depths,...] = F.pad(planeObj * batch_fftshift2d_real(torch.fft.irfft2(torch.fft.rfft2(Ratio) * planeOTF)),[-p for p in padSize]).type(ObjRecon.type())
+            
+            if verbose:
+                MI_projection_out= volume_2_projections(ObjRecon, depths_in_ch=True).cpu()
+
+                curr_error = errorMetric(ImgExp,ImgEst).item()
+                losses.append(curr_error)
+                if ii==nIt-1:
+                    end = "\n"
+                max_value =ObjRecon.float().max()
+                print(F'Deconv it: {ii+1} / {nIt} \t currErr: {curr_error} \t maxVal: {max_value}', end=end)
+                ## Uncomment to show some images
+                plt.subplot(1,3,1)
+                plt.imshow(ImgExp[0,0,...].cpu().numpy())
+                plt.subplot(1,3,2)
+                plt.imshow(ImgEst[0,0,...].cpu().numpy())
+                plt.subplot(1,3,3)
+                plt.imshow(MI_projection_out[0,0,...].cpu().numpy())
+                plt.pause(0.1)
+                plt.show()
+        
+    ObjRecon[:,0:nDepths//2-ROIsize[2]//2,...] = 0
+    ObjRecon[:,nDepths//2+ROIsize[2]//2:,...] = 0
+    return ObjRecon,MI_projection_out,ImgEst,losses, padSize, padSizeImg

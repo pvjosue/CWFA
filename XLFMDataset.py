@@ -20,7 +20,7 @@ def pad_img_to_min(image):
     """
     min_size = min(image.shape[-2:])
     img_pad = [min_size-image.shape[-1], min_size-image.shape[-2]]
-    img_pad = [img_pad[0]//2, img_pad[0]//2, img_pad[1],img_pad[1]]
+    img_pad = [img_pad[0]//2, img_pad[0]//2, img_pad[1]//2,img_pad[1]//2]
     image = F.pad(image.unsqueeze(0).unsqueeze(0), img_pad)[0,0]
     return image
 
@@ -203,7 +203,7 @@ class XLFMDatasetFull(data.Dataset):
     def __getitem__(self, index):
         views_out = self.stacked_views[[index],...]
         if self.load_vols is False:
-            return views_out,0,0,0
+            return views_out
         vol_out = self.vols[index,...]
         
         return views_out,vol_out, index, self.gt_cache
