@@ -43,7 +43,7 @@ Doing a 3D reconstruction involves running the CWFA backward:
 
 
 ## The dataset
-The dataset can be found at Zenodo under: todo
+The dataset can be found at Zenodo under: [Zenodo](https://zenodo.org/record/8024696)
 
 ## Examples
 ### Training the CWFA
