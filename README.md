@@ -82,4 +82,4 @@ Josue Page - pv.josue@gmail.com
 [gs-url]: https://scholar.google.com/citations?user=5WfCRjQAAAAJ&hl=en
 [product-screenshot]: images/screenshot.png
 [arxiv-shield]: https://img.shields.io/badge/-PDF-black.svg?style=flat-square&logo=arXiv&colorB=555
-[arxiv-url]: https://arxiv.org/abs/2005.08562
+[arxiv-url]: https://arxiv.org/abs/2306.06408
